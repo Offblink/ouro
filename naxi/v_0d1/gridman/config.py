@@ -11,27 +11,26 @@ class Config:
     name: str = 'gridman_mini'
 
     embed_dim: int = 512
-    block_layers: int = 6
+    block_layers: int = 4
     blocks: int = 2
 
-    patch_size: int = 512
+    patch_size: int = 64
     
     # 分词器
     tokenizer: ByteTokenizer = ByteTokenizer()
 
+    chunk_size: int = 128
+    bptt_size: int = 8
+
     # 预训练配置
-    pretrain_train_file: str = f'datasets/pretrain/pretrain_train.jsonl'
-    pretrain_lr: float = 4e-4
-    pretrain_chunk_size: int = 77
-    pretrain_bptt_size: int = 2
-    pretrain_steps: int = 138000
+    pretrain_train_file: str = f'/root/autodl-tmp/pretrain.jsonl'
+    pretrain_lr: float = 3e-4
+    pretrain_steps: int = 1056000*2
 
     # SFT 配置
-    sft_file: str = f'datasets/sft_mini_512/sft_mini_512_train.jsonl'
-    sft_chunk_size: int = 9
-    sft_bptt_size: int = 16
-    sft_lr: float = 6.25e-5
-    sft_steps: int = 230000
+    sft_train_file: str = f'/root/autodl-tmp/sft.jsonl'
+    sft_lr: float = 6e-5
+    sft_steps: int = 1056000
 
     # 版本号
     version: str = 'v_0d1'
@@ -51,39 +50,45 @@ GRIDMAN_MINI = Config()
 GRIDMAN_SMALL = Config(
     'gridman_small',
     768,
-    8,
-    2,
-    768,
-    pretrain_chunk_size=18,
-    pretrain_bptt_size=3,
-    pretrain_lr=2e-4,
-    pretrain_steps=400000
+    chunk_size=128,
+    bptt_size=7,
+
+    pretrain_lr=2.11e-4,
+    pretrain_steps=1056000*2,
+
+    sft_lr=4.2e-5,
+    sft_steps=1056000*2
 )
 
 GRIDMAN_MEDIUM = Config(
     'gridman_medium',
-    1024,
-    8,
-    3,
-    pretrain_chunk_size=15,
-    pretrain_bptt_size=2,
-    pretrain_steps=350000
+    1280,
+    chunk_size=64,
+    bptt_size=7,
+
+    pretrain_lr=1.5e-4,
+    pretrain_steps=1056000*2,
+
+    sft_lr = 1e-4,
+    sft_steps = 4200000
 )
 
 GRIDMAN_LARGE = Config(
     'gridman_large',
-    1280,
-    9,
-    4,
-    1280
+    1856,
+    chunk_size=64,
+    bptt_size=6,
+   
+    pretrain_lr=1e-4,
+    pretrain_steps=350000
 )
 
 GRIDMAN_XL = Config(
     'gridman_xl',
-    1600,
-    12,
-    4,
-    1280
+    2624,
+    7,
+    7
 )
 
-RUNNING_CONFIG = GRIDMAN_MINI
+
+RUNNING_CONFIG = GRIDMAN_MEDIUM

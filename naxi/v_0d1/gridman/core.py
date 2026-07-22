@@ -18,9 +18,10 @@ class Gridman(nn.Module):
         self.byte_emb = nn.Embedding(config.tokenizer.vocab_size, config.embed_dim)
         
         # Ouro
-        self.core_ouro = Ouro(self.embed_dim, config.blocks, config.block_layers)
+        self.core_ouro = Ouro(self.embed_dim, config.chunk_size, config.blocks, config.block_layers)
         
         # 输出头
+        self.out_norm = nn.LayerNorm(self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, config.tokenizer.vocab_size)
 
         torch.nn.init.normal_(self.byte_emb.weight, mean=0.0, std=0.02)
@@ -33,11 +34,12 @@ class Gridman(nn.Module):
     def forward(self, x: torch.Tensor, lock_mem: bool = False) -> torch.Tensor:
         x = self.byte_emb(x)
         x = self.core_ouro(x, lock_mem)
-        logits = self.out_proj(x)
+        logits = self.out_proj(self.out_norm(x))
         return logits
     
+    @torch.compiler.disable
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 512, temperature: float = 0.7) -> torch.Tensor:
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 90, temperature: float = 0.7) -> torch.Tensor:
         """
         自回归推理生成
         """

@@ -1,118 +1,415 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint
-    
-
-class RotaryPositionalEmbeddings(nn.Module):
-    def __init__(self, head_dim: int, max_seq_len=4096, base=50000.0):
-        super().__init__()
-
-        self.inv_freq: torch.Tensor
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer('inv_freq', inv_freq)
-
-        self.max_seq_len = max_seq_len
-        self.cos_cached: torch.Tensor
-        self.sin_cached: torch.Tensor
-        self._build_cache(max_seq_len)
-
-    def __call__(self, seq_len: int):
-        return self.forward(seq_len)
-
-    def _build_cache(self, seq_len: int):
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
-
-    def forward(self, seq_len: int):
-        if seq_len > self.max_seq_len:
-            self._build_cache(seq_len)
-        return self.cos_cached[:, :, :seq_len, ...], self.sin_cached[:, :, :seq_len, ...]
 
 
-def rotate_half(x: torch.Tensor):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+HEAD_DIM = 64
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
-class CausalSelfAttention(nn.Module):
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_position_embeddings: int = 64, base: float = 128.0):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim))
+
+        self.inv_freq: torch.Tensor
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        self.cos_cached: torch.Tensor
+        self.sin_cached: torch.Tensor
+        self._set_cos_sin_cache(self.max_position_embeddings, self.inv_freq.device, self.inv_freq.dtype)
+
+    def __call__(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x, seq_len)
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        self.max_position_embeddings = seq_len
+        t = torch.arange(self.max_position_embeddings, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if seq_len > self.max_position_embeddings:
+            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
+            
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+    
+
+class OuroNorm(nn.Module):
+    def __init__(self, embed_dim: int, init_bias: float = 0):
+        super().__init__()
+        self.embed_dim = embed_dim
+    
+        self.k_proj = nn.Linear(embed_dim, 1)
+        self.act = nn.Sigmoid()
+
+        nn.init.zeros_(self.k_proj.weight)
+        nn.init.constant_(self.k_proj.bias, init_bias)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        k = self.act(self.k_proj(x))
+        x_normed = F.normalize(x, p=2.0, dim=-1) * (self.embed_dim ** 0.5)
+        return k * x_normed
+
+
+class Attention(nn.Module):
+    def __init__(self, embed_dim: int, dropout: float = 0.0):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.head_dim = HEAD_DIM
+        self.num_heads = self.embed_dim // self.head_dim
+        self.dropout = dropout
+        
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        
+        # 初始化旋转位置编码模块
+        self.rotary_emb = RotaryEmbedding(
+            dim=self.head_dim
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        
+        qkv: torch.Tensor = self.qkv_proj(x)
+        
+        qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k  = self.q_norm(q), self.k_norm(k)
+        
+        cos, sin = self.rotary_emb(v, seq_len=seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        attn_output = F.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        output = self.out_proj(attn_output)
+        
+        return output
+
+
+class GateAttention(nn.Module):
+    def __init__(self, embed_dim: int, dropout: float = 0.1):  
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.head_dim = HEAD_DIM
+        self.num_heads = self.embed_dim // self.head_dim
+
+        self.dropout = dropout
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=False)
+
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        
+        q: torch.Tensor = self.q_proj(x)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        if state.dim() == 2:
+            state = state.unsqueeze(1) 
+            
+        kv: torch.Tensor = self.kv_proj(state)
+        kv = kv.view(batch_size, 1, 2, self.num_heads, self.head_dim)
+    
+        kv = kv.permute(2, 0, 3, 1, 4) 
+        k, v = kv[0], kv[1]
+
+        q, k = self.q_norm(q), self.k_norm(k)
+        
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+    
+        gate = torch.sigmoid(scores)
+        
+        if self.training and self.dropout > 0.0:
+            gate = F.dropout(gate, p=self.dropout)
+            
+        attn_output = gate * v  
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        
+        return attn_output
+
+
+class OuroStateAttention(nn.Module):
+    def __init__(self, embed_dim: int, dropout: float = 0.0):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.head_dim = HEAD_DIM
+        self.num_heads = self.embed_dim // self.head_dim
+
+        self.dropout = dropout
+
+        self.state_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.gate_attn = GateAttention(self.embed_dim, self.dropout)
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.attn = Attention(self.embed_dim, self.dropout)
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        state = state.unsqueeze(1)
+        state = self.state_proj(state)
+
+        state_injection: torch.Tensor = self.gate_attn(x, state) 
+        x = x + state_injection
+        return state_injection + self.attn(self.norm(x))
+
+
+class OuroDepthAttention(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
         self.embed_dim = embed_dim
-        self.heads = embed_dim // 64
-        self.head_dim = embed_dim // self.heads
+        self.head_dim = HEAD_DIM
+        self.num_heads = embed_dim // self.head_dim
 
-        self.qkv = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=False)
+        self.o_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        with torch.no_grad():
+            nn.init.zeros_(self.o_proj.weight)
+
+    def forward(self, active_c: torch.Tensor, history_states: list[torch.Tensor]) -> torch.Tensor:
+        batch_size = active_c.shape[0]
+        seq_len = history_states[0].shape[1]
+        num_layers = len(history_states)
+
+        H = torch.stack(history_states, dim=2)
         
-        qkv: torch.Tensor = self.qkv(x)
-        q, k, v = qkv.split(self.embed_dim, dim=2)
-
-        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        q_norm = self.norm_q(active_c) 
+        q: torch.Tensor = self.q_proj(q_norm)
         
-        return self.proj(y)
+        q = q.view(batch_size, 1, self.num_heads, 1, self.head_dim)
 
+        H_norm = self.norm_kv(H)
+        kv: torch.Tensor = self.kv_proj(H_norm)
+        
+        kv = kv.view(batch_size, seq_len, num_layers, 2, self.num_heads, self.head_dim)
+        kv = kv.permute(3, 0, 1, 4, 2, 5)
+        k, v = kv[0], kv[1]
 
-class OuroAttentionMixer(nn.Module):
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+
+        out = torch.matmul(attn_weights, v)
+        out = out.squeeze(-2).contiguous().view(batch_size, seq_len, self.embed_dim)
+
+        return self.o_proj(out)
+    
+
+class OuroTemporalAttention(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.head_dim = HEAD_DIM
+        self.num_heads = embed_dim // self.head_dim
+
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=False)
+        self.o_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        
+        with torch.no_grad():
+            nn.init.zeros_(self.o_proj.weight)
+
+    def forward(self, current_c: torch.Tensor, state_queue: torch.Tensor) -> torch.Tensor:
+        batch_size = current_c.shape[0]
+        
+        q_norm = self.norm_q(current_c)
+
+        q: torch.Tensor = self.q_proj(q_norm)
+        q = q.view(batch_size, self.num_heads, 1, self.head_dim)
+        
+        kv_norm = self.norm_kv(state_queue)
+        kv: torch.Tensor = self.kv_proj(kv_norm)
+        kv = kv.view(batch_size, state_queue.shape[1], 2, self.num_heads, self.head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        
+        out = torch.matmul(attn_weights, v)
+        out = out.squeeze(2).contiguous().view(batch_size, self.embed_dim)
+        return self.o_proj(out)
+    
+
+class FFN(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
 
-        self.norm = nn.LayerNorm(embed_dim)
-        self.att_norm = nn.LayerNorm(embed_dim)
+        self.embed_dim = embed_dim
 
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 4 * 6),
-            nn.SiLU(),
-            nn.Linear(embed_dim // 4 * 6, embed_dim)
-        )
+        self.multiple_of = 256
+        hidden_dim = int(2 * (4 * self.embed_dim) / 3)
+        self.hidden_dim = self.multiple_of * ((hidden_dim + self.multiple_of - 1) // self.multiple_of)
+        
+        self.w12 = nn.Linear(self.embed_dim, 2 * self.hidden_dim, bias=False)
+        self.act = nn.SiLU()
+        self.w3 = nn.Linear(self.hidden_dim, self.embed_dim, bias=False)
 
-        self.attn = CausalSelfAttention(embed_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        combined_projected = self.w12(x)
+        x_w1, x_v = torch.chunk(combined_projected, chunks=2, dim=-1)
+        
+        swiglu_out = self.act(x_w1) * x_v
+        return self.w3(swiglu_out)
+    
 
-    def __call__(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-        return self.forward(x, cos, sin)
+class OuroSTM(nn.Module):
+    def __init__(self, embed_dim: int, max_batch: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_batch = max_batch
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-        x_ffn = x + self.ffn(self.norm(x))
-        attn_context = self.attn(self.att_norm(x_ffn), cos, sin)
-        return attn_context, x_ffn
+        self.state_attn = OuroStateAttention(self.embed_dim)
+        self.act = nn.SiLU()
+
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.w = nn.Linear(self.embed_dim, self.embed_dim * 4)
+
+        self.c_state: torch.Tensor
+        self._pending_c_state: torch.Tensor
+        self._runtime_c_state: torch.Tensor | None = None
+
+        self.register_buffer("c_state", torch.zeros(self.max_batch, self.embed_dim))
+        self.state_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.ouro_norm = OuroNorm(self.embed_dim)
+
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+    def __call__(self, x: torch.Tensor, lock_mem: bool = False):
+        return self.forward(x, lock_mem)
+
+    def mem_detach(self):
+        self._runtime_c_state = self._runtime_c_state.detach()
+            
+        with torch.no_grad():
+            batch_size = self._runtime_c_state.shape[0]
+            self.c_state[:batch_size].copy_(self._runtime_c_state)
+
+    def mem_clear(self):
+        self._runtime_c_state = None
+        self.c_state.zero_()
+
+    def mem_sync(self):
+        self._runtime_c_state = self._pending_c_state    
+        del self._pending_c_state
+
+    def active_c(self, batch_size: int):
+        if self._runtime_c_state is None:
+            active_c = self.c_state[:batch_size].detach().clone()
+        else:
+            active_c = self._runtime_c_state
+        return active_c
+
+    def forward(self, x: torch.Tensor, lock_mem: bool = False):
+        batch_size, seq_len, _ = x.shape
+
+        active_c = self.active_c(batch_size)
+
+        state_attn = self.state_attn(x, active_c)
+        x = x + state_attn
+
+        # 计算门控信号
+        gates = self.w(x) 
+        i, f, g, o = torch.chunk(gates, 4, dim=-1)
+
+        i = torch.sigmoid(i)
+        g: torch.Tensor = self.act(g)
+        o = torch.sigmoid(o)
+
+        v = i * g  
+        f_gate = torch.sigmoid(f) 
+
+        c_states = []
+        curr_c = active_c 
+
+        # 线性时序扫描
+        for t in range(seq_len):
+            curr_c = f_gate[:, t, :] * curr_c + v[:, t, :]
+            c_states.append(curr_c)
+
+        c = torch.stack(c_states, dim=1)
+        h: torch.Tensor = o * self.act(self.norm(c))
+
+        # 更新 Buffer
+        if not lock_mem:
+            c_last = c[:, -1, :] 
+            c_last = self.state_proj(c_last)
+            self._pending_c_state = self.ouro_norm(c_last) 
+
+        return self.out_proj(h)
 
 
 class OuroLayer(nn.Module):
-    """
-    模块结构:
-    - 前缀注意力
-    - 动态 FFN 层: LayerNorm(因果 Mem @ Linear)
-    - 残差连接
-    """
-    def __init__(self, embed_dim: int, need_mem: bool = False):
+    def __init__(self, embed_dim: int, max_batch: int, need_mem: bool = False, need_stm: bool = False):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = self.embed_dim // 64
-        self.head_dim = self.embed_dim // self.num_heads
-        self.need_mem = need_mem
 
-        self.attn_mixer = OuroAttentionMixer(self.embed_dim)
+        self.embed_dim = embed_dim
+        self.head_dim = HEAD_DIM
+        self.num_heads = self.embed_dim // HEAD_DIM
+
+        self.max_batch = max_batch
+     
+        self.need_mem = need_mem
+        self.need_stm = need_stm
 
         self.act = nn.SiLU()
+        self.state_attn = OuroStateAttention(self.embed_dim)
+
+        if self.need_stm:
+            self.ouro_stm = OuroSTM(self.embed_dim, self.max_batch)
 
         # 开启标准的 Delte Rule 实现
         if self.need_mem:
@@ -121,120 +418,120 @@ class OuroLayer(nn.Module):
             # 全局记忆矩阵 
             self.mem: torch.Tensor
             self.register_buffer('mem', torch.eye(self.embed_dim).unsqueeze(0))
-            self.mem_g = nn.Linear(embed_dim, embed_dim)
+
+            self._causal_mask: torch.Tensor
+            self.register_buffer('_causal_mask', torch.ones(self.embed_dim, self.embed_dim, dtype=torch.bool).tril_(), persistent=False)
+
+            self.rotary_emb = RotaryEmbedding(dim=self.embed_dim)
 
             self.mem_norm = nn.LayerNorm(embed_dim)
 
-            self.w_q = nn.Linear(embed_dim, embed_dim)
-            self.w_k = nn.Linear(embed_dim, embed_dim)
-            self.w_v = nn.Linear(embed_dim, embed_dim)
-            self.w_g = nn.Linear(embed_dim, embed_dim)
-            self.w_o = nn.Linear(embed_dim, embed_dim * 4)
+            self.w_qkvgd = nn.Linear(embed_dim, embed_dim * 5)
 
-            self.o_proj = nn.Linear(embed_dim * 4 if self.need_mem else embed_dim, embed_dim)
+            self.w_o = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        
+            with torch.no_grad():
+                torch.nn.init.normal_(
+                    self.w_qkvgd.weight[3 * embed_dim : 4 * embed_dim, :], 
+                    mean=0.0, std=0.02
+                )
+                torch.nn.init.constant_(
+                    self.w_qkvgd.bias[3 * embed_dim : 4 * embed_dim], 
+                    -6.0
+                )
 
-            torch.nn.init.normal_(self.o_proj.weight, mean=0.0, std=0.02)
-            torch.nn.init.zeros_(self.o_proj.bias)
-
-    def __call__(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lock_mem: bool = False):
-        return self.forward(x, cos, sin, lock_mem)
+    def __call__(self, x: torch.Tensor, last_state: torch.Tensor | None = None, lock_mem: bool = False):
+        return self.forward(x, last_state, lock_mem)
     
     def mem_detach(self):
+        if self.need_stm:
+            self.ouro_stm.mem_detach()
         if self.need_mem:
             self.mem = self.mem.detach()
 
     def mem_clear(self):
+        if self.need_stm:
+            self.ouro_stm.mem_clear()
         if self.need_mem:
             self.mem = torch.zeros(1, self.embed_dim, self.embed_dim)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lock_mem: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        注意力混合
-        """
-        attn_context, x_ffn = self.attn_mixer(x, cos, sin)
+    def mem_sync(self):
+        if self.need_stm:
+            self.ouro_stm.mem_sync()
 
-        """
-        动态 FFN
-        """
-        # 构建动态的 FFN 层 [prev_mem * decay + cumsum(k^T @ v_dyn) / (self.embed_dim ** 0.5)] @ w_o
+    def forward(self, x: torch.Tensor, last_state: torch.Tensor | None = None, lock_mem: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _, seq_len, _ = x.shape
+    
+        x = x + self.state_attn(x, last_state)
+
         if self.need_mem:
-            mem_context: torch.Tensor = self.mem_norm(x_ffn + attn_context)
+            mem_context: torch.Tensor = self.mem_norm(x)
+            qkvgd: torch.Tensor= self.w_qkvgd(mem_context)
+            context_q, context_k, context_v, context_g, context_d = qkvgd.chunk(5, dim=-1)
 
-            context_q: torch.Tensor = self.w_q(mem_context)
+            cos, sin = self.rotary_emb(context_v, seq_len=seq_len)
+            cos = cos.squeeze(1)
+            sin = sin.squeeze(1)
+
+            context_q, context_k = apply_rotary_pos_emb(context_q, context_k, cos, sin)
+
             context_q = self.act(context_q)
-            context_k: torch.Tensor = self.w_k(mem_context)
-            context_k = F.normalize(context_k, p=2, dim=-1, eps=1e-5) 
-            context_v: torch.Tensor = self.w_v(mem_context)
-            context_g = torch.sigmoid(self.w_g(mem_context))
-        
-            batch_size, seq_len, _ = x.shape
+            context_q = F.normalize(context_q, p=2, dim=-1, eps=1e-5)
 
-            prev_mem = self.mem.expand(batch_size, -1, -1).to(x.device)
+            context_k = self.act(context_k)
+            context_k = F.normalize(context_k, p=2, dim=-1, eps=1e-5) 
+
+            context_v = self.act(context_v)
+
+            mem_g = torch.sigmoid(context_g) * (1.0 / seq_len)
 
             # 预测的 V
-            v_retrieved: torch.Tensor = torch.bmm(context_k, prev_mem) / (self.embed_dim ** 0.5)
+            v_retrieved: torch.Tensor = context_k @ self.mem
 
             # 计算真实 V 与预测 V 的 Delta
             delta_v = context_v - v_retrieved
-            v_dyn = context_g * delta_v
+            v_dyn = mem_g * delta_v
             
             # 外积更新
-            delta_mem: torch.Tensor = torch.bmm(context_k.transpose(-1, -2), v_dyn) / (self.embed_dim ** 0.5)
+            delta_mem: torch.Tensor = torch.bmm(context_k.transpose(-1, -2), v_dyn)
             
             # 记忆更新
-            mem_g: torch.Tensor = self.act(self.mem_g(prev_mem + delta_mem))
-            mem_g = torch.sigmoid(mem_g)
-
-            next_mem: torch.Tensor = mem_g * prev_mem + delta_mem
+            next_mem: torch.Tensor = self.mem + delta_mem
 
             if not lock_mem:
                 self._pending_mem = next_mem.mean(0, keepdim=True)
-
-            # q_t @ [prev_mem * decay + cumsum(k^T @ v_dyn) / (self.embed_dim ** 0.5)]
-            # (q_t @ prev_mem) + (q_t @ k^T) @ v_dyn
             
             # 历史记忆 
-            mem_out_prev = torch.bmm(context_q, prev_mem)
+            mem_out_prev = context_q @ self.mem
             
-            # Q 与 K 的标准注意力打分矩阵 (Q @ K^T) -> [B, L, L]
+            # QK 的标准注意力打分矩阵
             scores = torch.bmm(context_q, context_k.transpose(-1, -2)) 
-            
-            # 因果掩码 
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=scores.dtype))
-            scores_causal = scores * causal_mask
-           
-            # 标准注意力 (scores_causal @ V_dyn) -> [B, L, D]
-            mem_out_delta: torch.Tensor = torch.bmm(scores_causal, v_dyn) 
+          
+            # 标准注意力
+            mask = self._causal_mask[:seq_len, :seq_len]
+            scores.masked_fill_(~mask, 0.0)
+            mem_out_delta: torch.Tensor = torch.bmm(scores, v_dyn)
             
             # 合并输出
-            mem_out: torch.Tensor = (mem_out_prev + mem_out_delta) / (self.embed_dim ** 0.5)
+            mem_out = mem_out_prev
+            mem_out += mem_out_delta
 
-            context_o: torch.Tensor = self.w_o(mem_out)
-            mem_context = self.act(context_o)
-        
-            mem_context = self.o_proj(mem_context)
+            # 动态门控
+            mem_out = mem_out * self.act(context_d)
+            x = x + self.w_o(mem_out)
 
-            return x_ffn + attn_context + mem_context, scores_causal
+            return x, scores, x
 
-        return x_ffn + attn_context, None
-    
+        if self.need_stm:
+            stm = self.ouro_stm(x)
+            return x + stm, None, x + stm
+
     
 class OuroBlock(nn.Module):
-    """
-    OuroLayer 堆叠的模块
-
-    模块结构:
-    - Pre_Norm
-    - Attention
-    - FFN
-    - 残差连接
-
-    Attention 由 OuroLayer 行为涌现
-    """
-    def __init__(self, embed_dim: int, rope: RotaryPositionalEmbeddings, block_layers: int = 8):
+    def __init__(self, embed_dim: int, max_batch: int, block_layers: int = 4):
         super().__init__()
         self.embed_dim = embed_dim
-        self.rope = rope
+        self.max_batch = max_batch
         self.block_layers = block_layers
 
         self.act = nn.SiLU()
@@ -242,25 +539,22 @@ class OuroBlock(nn.Module):
         self.ouro_self_attn_proj = nn.Parameter(torch.zeros(embed_dim, embed_dim))
         self.ouro_self_attn_norm = nn.LayerNorm(self.embed_dim)
 
-        self.w_v = nn.Linear(embed_dim, embed_dim)
+        self.w_v = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_norm = nn.LayerNorm(embed_dim)
 
+        self.ouro_self_attn_output_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.ouro_self_attn_gate = nn.Linear(embed_dim, embed_dim, bias=False)
 
         self.ouro_layers: nn.ModuleList[OuroLayer] = nn.ModuleList([
-            OuroLayer(self.embed_dim, self.is_prime(_+1)) for _ in range(self.block_layers)
+            OuroLayer(self.embed_dim, self.max_batch, (_!=0), _==0) for _ in range(self.block_layers)
         ])
 
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            self.act,
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
+        self.ffn = FFN(self.embed_dim)
 
         self.norm = nn.LayerNorm(self.embed_dim)
 
-    def __call__(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lock_mem: bool = False):
-        return self.forward(x, cos, sin, lock_mem)
+    def __call__(self, x: torch.Tensor, last_state: torch.Tensor | None = None, lock_mem: bool = False):
+        return self.forward(x, last_state, lock_mem)
 
     def mem_detach(self):
         for layer in self.ouro_layers:
@@ -272,108 +566,131 @@ class OuroBlock(nn.Module):
             layer: OuroLayer
             layer.mem_clear()
 
-    @staticmethod
-    def is_prime(n):
-        if n <= 1:
-            return False
-        for i in range(2, int(n**0.5) + 1):
-            if n % i == 0:
-                return False
-        return True
-        
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lock_mem: bool = False) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
+    def mem_sync(self):
+        for layer in self.ouro_layers:
+            layer: OuroLayer
+            layer.mem_sync()
+    
+    def forward(self, x: torch.Tensor, last_state: torch.Tensor | None = None, lock_mem: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _, seq_len, _ = x.shape
         residual = x
 
         ouro_self_attn = torch.tensor(0.0)
 
+        out_list = []
         for layer in self.ouro_layers:
             layer: OuroLayer
             if layer.need_mem:
-                x, attn = layer(x, cos, sin, lock_mem)
+                x, attn, out = layer(x, last_state, lock_mem)
                 ouro_self_attn = ouro_self_attn + attn
-            else:
-                x: torch.Tensor
-                x, _ = checkpoint(layer, x, cos, sin, use_reentrant=False)
+            if layer.need_stm:
+                x, _, out = layer(x, last_state, lock_mem)
 
+            out_list.append(out)
             inner_residual = x
 
         # 涌现注意力 (Emergent Attention)
-        ouro_self_attn_residual = ouro_self_attn
-        ouro_self_attn = torch.bmm(ouro_self_attn, x)
-        ouro_self_attn_proj = self.ouro_self_attn_proj.unsqueeze(0).expand(batch_size, -1, -1)
-        ouro_self_attn: torch.Tensor = torch.bmm(ouro_self_attn, ouro_self_attn_proj) / (self.embed_dim ** 0.5)
-        ouro_self_attn = self.act(ouro_self_attn)
-        ouro_self_attn_normed: torch.Tensor = self.ouro_self_attn_norm(ouro_self_attn)
-        ouro_self_attn = torch.bmm(ouro_self_attn_normed, ouro_self_attn_normed.transpose(-1, -2))
-        ouro_self_attn = (ouro_self_attn_residual + ouro_self_attn) / (self.embed_dim ** 0.5)
+        scale_factor: torch.Tensor = self.embed_dim**(-0.5)
 
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=ouro_self_attn.dtype))
-        ouro_self_attn = ouro_self_attn.masked_fill(causal_mask == 0, float('-inf'))
-        ouro_self_attn = torch.softmax(ouro_self_attn, dim=-1) 
+        ouro_self_attn_residual = ouro_self_attn
+
+        x_proj: torch.Tensor = torch.matmul(x, self.ouro_self_attn_proj) * scale_factor
+        ouro_self_attn = torch.bmm(ouro_self_attn_residual, x_proj)
+        
+        ouro_self_attn: torch.Tensor = self.act(ouro_self_attn)
+        ouro_self_attn_normed: torch.Tensor = self.ouro_self_attn_norm(ouro_self_attn)
+
+        v_states: torch.Tensor = self.w_v(self.v_norm(residual))
+
+        causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device).tril()
+        attn_bias: torch.Tensor = (ouro_self_attn_residual * scale_factor).masked_fill(~causal_mask, float('-inf'))
+
+        ouro_self_attn_output = F.scaled_dot_product_attention(
+            ouro_self_attn_normed.unsqueeze(1),
+            ouro_self_attn_normed.unsqueeze(1),
+            v_states.unsqueeze(1),
+            attn_mask=attn_bias.unsqueeze(1),
+            scale=scale_factor
+        ).squeeze(1) 
+
+        ouro_self_attn_output: torch.Tensor = self.ouro_self_attn_output_proj(ouro_self_attn_output)
 
         # 注意力门控
-        ouro_self_attn_output = torch.bmm(ouro_self_attn, self.w_v(self.v_norm(residual))) / (self.embed_dim ** 0.5)
         gate = torch.sigmoid(self.act(self.ouro_self_attn_gate(residual)))
         residual = residual + gate * ouro_self_attn_output
 
         # 标准输出
         x = self.ffn(self.norm(residual))
         x = x + residual + inner_residual
-        return x
+        out_list.append(x)
+
+        return x, out_list
     
 
 class Ouro(nn.Module):
     """
     Ouro 标准模型
-    由 OuroBlocks 堆叠而成
     """
-    def __init__(self, embed_dim: int, blocks: int, block_layers: int = 8):
+    def __init__(self, embed_dim: int, max_batch: int, blocks: int, block_layers: int = 2):
         super().__init__()
         self.embed_dim = embed_dim
+        self.max_batch = max_batch
         self.blocks = blocks
 
-        self.rope = RotaryPositionalEmbeddings(64)
+        self.in_norm = nn.LayerNorm(embed_dim)
+        self.in_attn = Attention(self.embed_dim)
+        self.in_ffn = FFN(self.embed_dim)
 
+        self.temporal_queue_len = 65
+        self.c_state_queue: torch.Tensor
+        self.register_buffer("c_state_queue", torch.zeros(max_batch, self.temporal_queue_len, embed_dim))
+        self.temporal_attn = OuroTemporalAttention(embed_dim)
+        self.state_ffn = FFN(self.embed_dim)
+    
         self.ouro_blocks = nn.ModuleList([
-            OuroBlock(embed_dim, self.rope, block_layers) for _ in range(blocks)
+            OuroBlock(embed_dim, self.max_batch, block_layers) for _ in range(blocks)
         ])
-
-        self.norm = nn.LayerNorm(embed_dim)
 
         self.attnres_queries = nn.ParameterList([
-            nn.Parameter(torch.zeros(embed_dim)) for _ in range(self.blocks)
+            nn.Parameter(torch.zeros(embed_dim)) for _ in range(self.blocks - 1)
         ])
-        
         self.attnres_k_norm = nn.LayerNorm(embed_dim)
+        self.final_depth_attn = OuroDepthAttention(self.embed_dim)
+        self.m_ffn = FFN(self.embed_dim)
 
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.SiLU(),
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
+        self.out_norm = nn.LayerNorm(embed_dim)
+        self.out_attn = Attention(self.embed_dim)
+        self.out_ffn = FFN(self.embed_dim)
+
+        self.stm = OuroSTM(self.embed_dim, self.max_batch)
 
     def __call__(self, x: torch.Tensor, lock_mem: bool = False):
         return self.forward(x, lock_mem)
 
     def mem_detach(self):
+        self.stm.mem_detach()
+        self.c_state_queue = self.c_state_queue.detach()
         for blocks in self.ouro_blocks:
             blocks: OuroBlock
             blocks.mem_detach()
 
     def mem_clear(self):
+        self.stm.mem_clear()
+        self.c_state_queue.zero_()
         for blocks in self.ouro_blocks:
             blocks: OuroBlock
             blocks.mem_clear()
 
     def mem_sync(self):
-        """
-        同步所有 OuroLayer 的 mem
-        """
+        self.stm.mem_sync()
+
+        for block in self.ouro_blocks:
+            block: OuroBlock
+            block.mem_sync()
+
         pending_mems = []
         mem_layers = []
 
-        # 收集所有需要同步更新的 mem
         for block in self.ouro_blocks:
             block: OuroBlock
             for layer in block.ouro_layers:
@@ -389,26 +706,39 @@ class Ouro(nn.Module):
                 dist.all_reduce(stacked_mems, op=dist.ReduceOp.SUM)
                 stacked_mems = stacked_mems / dist.get_world_size()
 
-            # 将同步后的 mem 更新回各个 layer
             for i, layer in enumerate(mem_layers):
                 local_mem: torch.Tensor = pending_mems[i]
                 synced_mem = stacked_mems[i]
                 layer.mem = local_mem + (synced_mem - local_mem).detach()
                 layer._pending_mem = None
         else:
-            # 单卡环境
             for layer in mem_layers:
                 layer.mem = layer._pending_mem
-                layer._pending_mem = None            
+                layer._pending_mem = None           
 
     def forward(self, x: torch.Tensor, lock_mem: bool = False) -> torch.Tensor:
-        _, seq_len, _ = x.shape
-        cos, sin = self.rope(seq_len)
+        batch_size, _, _ = x.shape
 
-        history_states = [x]
+        x0 = x
 
-        # 注意力残差
+        # 标准输入
+        x = x + self.in_attn(self.in_norm(x))
+        x = x + self.in_ffn(x)
+
+        # 状态获取
+        base_active_c = self.stm.active_c(batch_size).to(torch.bfloat16)
+       
+        queue = self.c_state_queue[:batch_size]
+        queue_history = queue[:, :-1, :]
+        temporal_context = self.temporal_attn(base_active_c, queue_history)
+        active_c = base_active_c + temporal_context
+        active_c = active_c + self.state_ffn(active_c)
+
+        # 计算核心
+        history_states = [x0, x]
+
         for i, block in enumerate(self.ouro_blocks):
+            block: OuroBlock
             if i > 0:
                 stacked_history = torch.stack(history_states, dim=2)
                 
@@ -419,26 +749,32 @@ class Ouro(nn.Module):
                 scores = torch.matmul(keys, q) / (self.embed_dim ** 0.5)
                 alpha = F.softmax(scores, dim=-1)
                 x = torch.sum(alpha.unsqueeze(-1) * values, dim=2)
-
-            x = block(x, cos, sin, lock_mem)
-            history_states.append(x)
-
+                                                  
+            x, out_list = block(x, active_c, lock_mem)
+            history_states.extend(out_list)
             residual = x
 
-        stacked_history = torch.stack(history_states, dim=2)
+        depth_attn_out = self.final_depth_attn(active_c, history_states)
+        x = residual + depth_attn_out
+        x = x + self.m_ffn(x)
+
+        # 标准输出
+        x = x + self.out_attn(self.out_norm(x))
+        x = x + self.out_ffn(x)
+        out = self.stm(x)
+
+        # 状态更新
+        if not lock_mem:
+            new_c = self.stm._pending_c_state 
+            next_queue = torch.roll(self.c_state_queue.clone(), shifts=-1, dims=1)
+            next_queue[:batch_size, -1, :] = new_c
+            self.c_state_queue = next_queue
         
-        keys = self.attnres_k_norm(stacked_history) 
-        values = stacked_history 
-        q = self.attnres_queries[-1]
-
-        scores = torch.matmul(keys, q) / (self.embed_dim ** 0.5)
-        alpha = F.softmax(scores, dim=-1)
-        x = torch.sum(alpha.unsqueeze(-1) * values, dim=2)
-
-        x = residual + self.ffn(x)
-
-        return self.norm(x)
+        return out
 
         
+
+
+
 
 

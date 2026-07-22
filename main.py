@@ -14,8 +14,8 @@ def main(mode: str = 'chat', is_sft: bool = False, test_only: bool = False):
                     dist.destroy_process_group()
 
     if mode == 'chat':
-        gridman_chat()
+        gridman_chat(is_sft)
 
 
 if __name__ == '__main__':
-    main()
+    main('chat', False, False)
