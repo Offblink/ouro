@@ -11,7 +11,7 @@
 [![GitHub Code License](https://img.shields.io/github/license/ljc-ouro/ouro)](LICENSE)
 [![GitHub last commit](https://img.shields.io/github/last-commit/ljc-ouro/ouro)](https://github.com/ljc-ouro/ljc-ouro/commits/master)
 [![GitHub pull request](https://img.shields.io/badge/PRs-welcome-blue)](https://github.com/ljc-ouro/ouro/pulls)
-[![Collection](https://img.shields.io/badge/🤖-Gridman%20%20Collection-blue)](https://hf.co/collections/ljc-ouro/gridman)
+[![Collection](https://img.shields.io/badge/🤖-Gridman%20%20Collection-blue)](https://hf.co/collections/maphy-ouro/gridman)
 
 </div>
 
