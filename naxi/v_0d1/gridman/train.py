@@ -121,8 +121,13 @@ def train_model(is_sft: bool = False, grad_accum_steps: int = 1):
 
     grid_man = torch.compile(grid_man)
     # 此处为强制类型标记
-    grid_man: Gridman = DDP(grid_man, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=(bptt_size==1))
+    grid_man: Gridman = DDP(grid_man, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
     grid_man_module: Gridman = grid_man.module
+
+    # L2 状态约束损失（等效原理）开关
+    l2_enabled = config.l2_weight > 0
+    if l2_enabled and local_rank == 0:
+        print(f'🧠 L2 状态约束损失已开启, weight = {config.l2_weight}')
 
     optimizer = torch.optim.AdamW(grid_man.parameters(), lr=lr)
 
@@ -138,6 +143,7 @@ def train_model(is_sft: bool = False, grad_accum_steps: int = 1):
 
     loss_acc = torch.tensor(0.0, device=device)
     loss_acc_log = torch.tensor(0.0, device=device)
+    loss_l2_log = torch.tensor(0.0, device=device)
 
     optimizer.zero_grad()
 
@@ -163,6 +169,9 @@ def train_model(is_sft: bool = False, grad_accum_steps: int = 1):
 
         sync_context = grid_man.no_sync() if not is_update_step  else nullcontext()
         
+        # L2 状态约束：让前向记录 s_t / dW
+        grid_man_module.core_ouro.l2_enabled = l2_enabled
+
         with sync_context:
             with torch.amp.autocast('cuda', dtype=dtype):
                 logits = grid_man(inputs)
@@ -176,12 +185,22 @@ def train_model(is_sft: bool = False, grad_accum_steps: int = 1):
                     )
                 else: 
                     loss = logits.sum() * 0.0
+
+                # 等效原理：L2 = ||dW - J ds||^2（随机探针 VJP 形式）
+                if l2_enabled:
+                    l2_loss = grid_man_module.core_ouro.state_constraint_loss()
+                    loss = loss + config.l2_weight * l2_loss
+                else:
+                    l2_loss = torch.tensor(0.0, device=device)
             
             loss_acc = loss_acc + loss
 
             with torch.no_grad():
                 dist_loss = reduce_value(loss)
                 loss_acc_log = loss_acc_log + dist_loss
+                if l2_enabled:
+                    dist_l2 = reduce_value(l2_loss)
+                    loss_l2_log = loss_l2_log + dist_l2
 
             if is_bptt_step:
                 loss_for_backward = loss_acc / (bptt_size * grad_accum_steps)
@@ -201,10 +220,14 @@ def train_model(is_sft: bool = False, grad_accum_steps: int = 1):
                 avg_loss = loss_acc_log.item() / (bptt_size * grad_accum_steps)
                 writer.add_scalar('Train/Loss', avg_loss, step)
                 writer.add_scalar('Train/Grad_Norm', total_norm, step)
+                if l2_enabled:
+                    avg_l2 = loss_l2_log.item() / (bptt_size * grad_accum_steps)
+                    writer.add_scalar('Train/L2_Constraint', avg_l2, step)
                 writer.add_scalar('Train/LR', optimizer.param_groups[0]['lr'], step)
                 print(f'\n📌 Step {step_true} | Total Loss = {avg_loss:.4f}')
 
             loss_acc_log = torch.tensor(0.0, device=device)
+            loss_l2_log = torch.tensor(0.0, device=device)
 
         if step_true % 3600 == 0 and local_rank == 0:
             save_checkpoint(grid_man_module, is_sft)

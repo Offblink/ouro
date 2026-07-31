@@ -414,6 +414,7 @@ class OuroLayer(nn.Module):
         # 开启标准的 Delte Rule 实现
         if self.need_mem:
             self._pending_mem = None
+            self._last_delta_mem = None  # L2 状态约束损失用：本层记忆更新量 dW
 
             # 全局记忆矩阵 
             self.mem: torch.Tensor
@@ -494,7 +495,10 @@ class OuroLayer(nn.Module):
             
             # 外积更新
             delta_mem: torch.Tensor = torch.bmm(context_k.transpose(-1, -2), v_dyn)
-            
+
+            # L2 状态约束：捕获本层 dW（依赖当前状态的图节点）
+            self._last_delta_mem = delta_mem if not lock_mem else None
+
             # 记忆更新
             next_mem: torch.Tensor = self.mem + delta_mem
 
@@ -664,6 +668,11 @@ class Ouro(nn.Module):
 
         self.stm = OuroSTM(self.embed_dim, self.max_batch)
 
+        # L2 状态约束损失（等效原理）：训练时由 train.py 开启
+        self.l2_enabled = False
+        self._l2_state_t: torch.Tensor | None = None   # 前向前的状态 s_t（可微叶）
+        self._l2_state_next: torch.Tensor | None = None  # 前向后的状态 s_{t+1}
+
     def __call__(self, x: torch.Tensor, lock_mem: bool = False):
         return self.forward(x, lock_mem)
 
@@ -727,6 +736,11 @@ class Ouro(nn.Module):
 
         # 状态获取
         base_active_c = self.stm.active_c(batch_size).to(torch.bfloat16)
+
+        # L2 状态约束：把 s_t 变成可微叶，供 VJP 计算 J^T v
+        if self.l2_enabled and not lock_mem:
+            base_active_c = base_active_c.detach().clone().requires_grad_(True)
+            self._l2_state_t = base_active_c
        
         queue = self.c_state_queue[:batch_size]
         queue_history = queue[:, :-1, :]
@@ -765,12 +779,73 @@ class Ouro(nn.Module):
 
         # 状态更新
         if not lock_mem:
-            new_c = self.stm._pending_c_state 
+            new_c = self.stm._pending_c_state
+            if self.l2_enabled:
+                self._l2_state_next = new_c.detach()
             next_queue = torch.roll(self.c_state_queue.clone(), shifts=-1, dims=1)
             next_queue[:batch_size, -1, :] = new_c
             self.c_state_queue = next_queue
         
         return out
+
+    def state_constraint_loss(self, n_probes: int = 8) -> torch.Tensor:
+        """
+        L2 状态约束损失（等效原理的随机化实现）。
+
+        理论：L2 = E[ || dW - J ds ||^2 ]，其中 dW = Σ delta_mem，J = ∂W/∂s。
+        随机化：对高斯探针 v，E[<x, v>^2] = ||x||^2，故
+
+            L2 = E_v[ (<dW, v> - <J ds, v>)^2 ]
+               = E_v[ (<dW, v> - ds · J^T v)^2 ]
+
+        J^T v 用 torch.autograd.grad (VJP) 计算；n_probes 个探针通过
+        is_grads_batched=True 在一次反向传播内完成，降方差不增成本。
+
+        注意：梯度只流过 <dW, v> 项，<J ds, v> 作为冻结目标——
+        这是稳定的一阶近似（避免对 Jacobian 的二阶求导）。
+        """
+        if not self.l2_enabled:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        s_t = self._l2_state_t
+        s_next = self._l2_state_next
+        if s_t is None or s_next is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        ds = (s_next - s_t.detach()).detach()  # [batch, embed_dim] 常数方向
+
+        # 收集所有 mem 层的 dW
+        dWs = []
+        for block in self.ouro_blocks:
+            for layer in block.ouro_layers:
+                if layer.need_mem and layer._last_delta_mem is not None:
+                    dWs.append(layer._last_delta_mem)
+        if not dWs:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # n 个随机探针，[n, b, d, d]（is_grads_batched 要求 grad_outputs 前导为探针维）
+        probes = [torch.randn(n_probes, *dw.shape, device=dw.device, dtype=dw.dtype) for dw in dWs]
+
+        # 一次反向传播算出所有层的 VJP 批次: J_i^T v_i
+        vjps = torch.autograd.grad(
+            dWs, s_t, grad_outputs=probes,
+            retain_graph=True, allow_unused=True, is_grads_batched=True,
+        )
+
+        loss = torch.tensor(0.0, device=s_t.device)
+        n = 0
+        for dw, probe, vjp in zip(dWs, probes, vjps):
+            if vjp is None:
+                continue
+            # <dW, v> - ds · (J^T v)，每个探针一个标量
+            residual = (dw.unsqueeze(0) * probe).sum(dim=(-3, -2, -1)) - \
+                       (ds * vjp).sum(dim=(-2, -1))
+            loss = loss + residual.pow(2).mean()
+            n += 1
+
+        if n == 0:
+            return torch.tensor(0.0, device=s_t.device)
+        return loss / n
 
         
 

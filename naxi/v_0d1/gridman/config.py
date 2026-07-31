@@ -22,6 +22,9 @@ class Config:
     chunk_size: int = 128
     bptt_size: int = 8
 
+    # L2 状态约束损失（等效原理）权重，0.0 = 关闭
+    l2_weight: float = 0.0
+
     # 预训练配置
     pretrain_train_file: str = f'/root/autodl-tmp/pretrain.jsonl'
     pretrain_lr: float = 3e-4
