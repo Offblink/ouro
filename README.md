@@ -414,6 +414,89 @@ $$\text{Attn}=\text{LinearAttn}+\Delta\text{LinearAttn}$$
 
 ---
 
+# 📌 Acheron Thinking（冥河思考）
+
+> 本 fork 新增：基于 Ouro 状态架构的仿生思考机制。**纯推理侧，零训练改动**，是验证 Ouro 状态动力学的一把钥匙。
+
+## 💡 理念
+
+主流的 CoT / ToT / ReAct 等思考方式本质是 **prompt 层面的技巧**——把推理过程外化为文本 token。Acheron 反其道而行：
+
+- 不生成任何推理 token，让模型内部状态在**吸引子动力学**中自循环演化
+- 状态收敛后再生成回答——「先想清楚，再开口」
+- 充分利用 Ouro 的三大状态组件：`mem` 矩阵（联想记忆）、`c_state`（工作记忆）、`c_state_queue`（情景缓冲）
+
+## 🚀 快速开始
+
+```bash
+python main_think.py                              # 交互模式（默认 focused）
+python main_think.py --query "人生的价值是什么"     # 单次查询
+python main_think.py --mode divergent             # 默认发散模式
+```
+
+### 交互命令
+
+| 命令 | 效果 |
+|------|------|
+| `/focus 问题` | **聚焦思考**：快速收敛，适合事实性/直接问题 |
+| `/diverge 问题` | **发散思考**：噪声注入 + 极紧阈值，探索更深 |
+| `/reflect 问题` | **反思思考**：双重 query 重读，通过 temporal attention 回顾上一步状态 |
+| `/preview` | 开关心声预览（思考过程可视化） |
+| `/trajectory` | 查看上轮思考的完整能量轨迹 |
+| `/clear` | 清空工作记忆（保留训练好的长期记忆） |
+| `/quit` | 退出 |
+
+## 🧠 三种思考模式
+
+| 模式 | 前向次数 | 方差 | 收敛阈值 | 定位 |
+|------|---------|------|---------|------|
+| focused | ~4 次重读 | 低 | 1e-3 | 稳定中上，低风险 |
+| divergent | 多变 + 噪声 | **高** | 5e-5 | 创意探索，偶有惊艳经常跑偏 |
+| reflective | ~8 次（双重重读） | 低 | 1e-3 | 反复确认，更慢更慎重 |
+
+## ⚙️ 工作原理
+
+### 1. Query 重读（核心）
+
+每步思考重新处理完整 query 序列。关键：**seq_len > 1 时 mem 更新阻尼 `1/seq_len` 生效**，知识（mem 矩阵）以温和方式参与联想检索，而非被冻结或被污染。
+
+```python
+# thinking.py 中的核心循环
+for step in range(max_steps):
+    self._think_step(input_ids)      # 重读 query，mem 阻尼演化
+    current_state = self._get_current_state()
+    energy = ||current_state - prev_state||² / dim
+    if energy < threshold: break      # 状态稳定 → 收敛 → 输出
+```
+
+### 2. 收敛检测
+
+以能量函数 `E(t) = ||c_t - c_{t-1}||² / dim` 监测 STM 状态变化率。能量低于阈值即认为思考完成——对应大脑「决策落定」的过程。
+
+### 3. 思考可视化（/preview）
+
+每步思考后做一次微型自回归生成，展示「如果此刻停止思考，模型会说什么」——内心独白的演变轨迹。
+
+## 📊 实验发现
+
+在 Gridman-Medium 上的对比实验（同一问题、3 次重复、关键词命中统计）：
+
+| 模式 | 平均关键词命中 |
+|------|--------------|
+| 不思考（原始 SFT） | 最高，最稳定 |
+| focused | 4.0 |
+| divergent | 1.7 |
+
+**结论**：思考机制改变了状态演化路径，但**无法超越模型的知识上限**。思考只能重新采样训练中学到的模式——这印证了训练目标的重要性（详见本 fork 提交的 [issue #4](https://github.com/zhihumomo/ouro/issues/4)）。
+
+## ⚠️ 已知限制
+
+1. **训练目标未奖励思考**：`train.py` 只有交叉熵，理论中的 $L_2$ 状态约束损失未实现，状态演化未被训练奖励
+2. **思考不创造知识**：mem 矩阵承载的知识固定，思考只是改变激活哪些学过的模式
+3. 当前模型（4MB 训练）的吸引子较弱，思考效果受限于此
+
+---
+
 # 🎓 引用
 
 如果 `Ouro` 对您的研究或工作有所帮助，欢迎引用：
